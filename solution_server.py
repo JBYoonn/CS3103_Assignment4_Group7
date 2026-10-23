@@ -1,144 +1,54 @@
 #!/usr/bin/env python3
 """
-CS3103 Assignment 4 - LiveRecall naive working baseline.
-
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
-
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
+CS3103 Assignment 4 - LiveRecall server (Group 7).
 
 Required evaluator command:
     python solution_server.py --port 8765
 
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
+Design (details in README.md and the liverecall/ modules):
+  liverecall/state.py   revision state, durable finals, bounded history, HISTORY selection
+  liverecall/outbox.py  per-client bounded outbox with semantic coalescing / batching
+  liverecall/flow.py    ping-based lag detection + per-client message-rate control
+  liverecall/server.py  WebSocket wiring: source -> state -> hub -> per-client sender tasks
+
+Optional, for experiments only (the evaluator uses the defaults):
+  --profile basic    conventional per-client FIFO queues (the "before" configuration)
+  --profile noflow   coalescing only, no lag detection / pacing / batching
+  --profile noticks  full design without TICK padding
+  LIVERECALL_PROFILE=basic python run_demo.py ...   same, through the public test runner
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-from typing import Any
+import os
 
-import websockets
-
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+from liverecall.server import LiveRecallServer, Profile
 
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
-
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    if not CLIENTS:
-        return
-
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
-
-
-async def handle_source(ws, hello: dict[str, Any]) -> None:
-    session = hello.get("session")
-    print(f"source connected: session={session}", flush=True)
-
-    try:
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            msg_type = msg.get("type")
-            if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
-            elif msg_type == "SOURCE_DONE":
-                # Test-control message. The specification does not require it
-                # to be forwarded to clients.
-                print("source finished", flush=True)
-            else:
-                # Forward compatibility: ignore fields/messages this baseline
-                # doesn't understand rather than crashing.
-                continue
-    finally:
-        print("source disconnected", flush=True)
-
-
-async def handle_client(ws, hello: dict[str, Any]) -> None:
-    client_id = hello.get("client_id")
-
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
-    try:
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
-        async for _ in ws:
-            pass
-    finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
-
-
-async def handler(ws) -> None:
-    try:
-        raw = await asyncio.wait_for(ws.recv(), timeout=5)
-        hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
-        await ws.close(code=1008, reason="Expected a valid hello message")
-        return
-
-    msg_type = hello.get("type")
-    if msg_type == "SOURCE_HELLO":
-        await handle_source(ws, hello)
-    elif msg_type == "CLIENT_HELLO":
-        await handle_client(ws, hello)
-    else:
-        await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
-
-
-async def main_async(port: int) -> None:
-    async with websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
-        max_size=2**20,
-        ping_interval=20,
-        ping_timeout=20,
-    ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
-        await asyncio.Future()
+async def main_async(args) -> None:
+    app = LiveRecallServer(Profile.from_name(args.profile), verbose=args.verbose)
+    server = await app.start(args.host, args.port)
+    print(f"LiveRecall listening on ws://{args.host}:{args.port} (profile={app.profile.name})", flush=True)
+    if args.stats_every > 0:
+        asyncio.create_task(app.report_forever(args.stats_every))
+    async with server:
+        await server.serve_forever()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="LiveRecall caption server")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--profile", default=os.environ.get("LIVERECALL_PROFILE", "full"),
+                        choices=["full", "basic", "noflow", "noticks"])
+    parser.add_argument("--stats-every", type=float, default=10.0,
+                        help="seconds between status lines (0 = off)")
+    parser.add_argument("--verbose", action="store_true", help="log every client connect/disconnect")
     args = parser.parse_args()
     try:
-        asyncio.run(main_async(args.port))
+        asyncio.run(main_async(args))
     except KeyboardInterrupt:
         pass
 
