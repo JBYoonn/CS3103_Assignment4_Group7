@@ -28,15 +28,16 @@ import asyncio
 import json
 from typing import Any
 from collections import OrderedDict, deque
-
+import time
 import websockets
-
+from websockets.exceptions import ConnectionClosed
 
 # Bounds
 MAX_HISTORY_SECONDS = 60
 MASTER_HISTORY_SECONDS = 120
 CLIENT_MAX_PENDING = 128
-
+LAG_SECONDS = 1.0
+MAX_UNACKED_PINGS = 1
 
 class Client:
     """State of one client"""
@@ -68,7 +69,57 @@ class Client:
             self.pending[key] = (raw, final)
         self.wakeup.set()
         return True
-            
+
+    async def run_sender(self) -> None:
+        """Empty pending map.
+        
+        After every ping via WebSocket ping. If more than MAX_UNACKED_PINGS are unanswered,
+        we stop sending and wait. This will limit the amount of traffic to the slower client,
+        while the pending map fills up, where it will coalesced with newer segments.
+        A client whose oldest unanswered ping is older than LAG_SECONDS is only sent finals.
+        """
+        waiters: deque[tuple[float, asyncio.Future]] = deque() # (send_at, pong)
+        since_ping = 0
+        try:
+            while True:
+                while waiters and waiters[0][1].done():
+                    waiters.popleft()
+                    
+                lagging = bool(waiters) and time.monotonic() - waiters[0][0] > LAG_SECONDS
+                key = self._next_key(finals_only=lagging)
+
+                if key is None:
+                    if self.pending:
+                        # only provisionals left and client lagging
+                        # wait for client to catch up or new final arrive
+                        await asyncio.wait([waiters[0][1]], timeout=0.1)
+                    else:
+                        self.wakeup.clear()
+                        await self.wakeup.wait()
+                    continue
+
+                raw, final = self.pending.pop(key)
+                await self.ws.send(raw)
+                self.sent += 1
+                since_ping += 1
+                if since_ping > MAX_UNACKED_PINGS:
+                    since_ping = 0
+                    waiters.append((time.monotonic(), await self.ws.ping()))
+                    while len(waiters) > MAX_UNACKED_PINGS:
+                        await waiters[0][1]
+                        waiters.popleft()
+        except ConnectionClosed:
+            pass
+
+    def _next_key(self, finals_only: bool) -> Any:
+        if not self.pending:
+            return None
+        if not finals_only:
+            return next(iter(self.pending))
+        for key, (_raw, final) in self.pending.items(): # finals_only True
+            if final:
+                return key
+        return None
 
 # to be deleted
 async def broadcast_naively(raw_message: str) -> None:
