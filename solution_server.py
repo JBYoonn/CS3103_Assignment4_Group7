@@ -54,6 +54,21 @@ class Client:
         self.coalesced = 0
         self.closing = False
 
+    def enqueue(self, key: Any, raw: str, final: bool) -> bool:
+        """Queues one msg. Return false if client is too far behind"""
+        waiting = self.pending.get(key)
+        if waiting is not None:
+            if waiting[1]:
+                return True # a final was queued
+            self.pending[key] = (raw, final)
+            self.coalesced += 1
+        else:
+            if len(self.pending) >= CLIENT_MAX_PENDING:
+                return False
+            self.pending[key] = (raw, final)
+        self.wakeup.set()
+        return True
+            
 
 # to be deleted
 async def broadcast_naively(raw_message: str) -> None:
