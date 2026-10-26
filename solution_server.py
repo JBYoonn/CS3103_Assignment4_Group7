@@ -31,6 +31,7 @@ from collections import OrderedDict, deque
 import time
 import websockets
 from websockets.exceptions import ConnectionClosed
+import socket
 
 # Bounds
 MAX_HISTORY_SECONDS = 60
@@ -42,6 +43,7 @@ PING_EVERY = 4
 SEGMENT_STATE_MAX = 2048
 HISTORY_MAX_ITEMS = 2048
 STATS_INTERVAL = 10.0
+CLIENT_SNDBUF = 32 * 1024
 
 
 def _newer(seg: int, rev: int, base_seg: int, base_rev: int) -> bool:
@@ -254,25 +256,20 @@ class LiveRecallServer:
 
 STATE = LiveRecallServer()
 
-# to be deleted
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
 
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
+def _shrink_send_buffer(ws) -> None:
+    """Run once per client.
+    Ensure smaller buffer such that backlog builds up on server-side per-client queue instead.
+    So that newer revisions can replace older ones.
     """
-    if not CLIENTS:
+    sock = ws.transport.get_extra_info("socket") if ws.transport else None
+    if sock is None:
         return
-
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, CLIENT_SNDBUF)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
