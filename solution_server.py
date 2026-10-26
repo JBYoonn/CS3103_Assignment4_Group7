@@ -39,7 +39,8 @@ CLIENT_MAX_PENDING = 128
 LAG_SECONDS = 1.0
 MAX_UNACKED_PINGS = 1
 PING_EVERY = 4
-
+SEGMENT_STATE_MAX = 2048
+HISTORY_MAX_ITEMS = 2048
 
 def _newer(seg: int, rev: int, base_seg: int, base_rev: int) -> bool:
     return seg > base_seg or (seg == base_seg and rev > base_rev)
@@ -126,6 +127,81 @@ class Client:
             if final:
                 return key
         return None
+
+
+class LiveRecallServer:
+    def __init__(self) -> None:
+        self.clients: set[Client] = set()
+        # finalized captions -> (server_recv_time, segment, revision, item_dict)
+        self.history: deque[tuple[float, int, int, dict]] = deque()
+        # segment -> (revision, final) for recent segments
+        self.segment_state: OrderedDict[int, tuple[int, bool]] = OrderedDict()
+        # provisional update of the segment currently in progress
+        self.active: tuple[int, int, str] | None = None # (seg, rev, raw)
+        self.updates_in = 0
+        self.updates_ignored = 0
+        self.slow_disconnects = 0
+
+    # source side
+    def accept_update(self, msg: dict[str, Any]) -> None:
+        try:
+            seg = int(msg["segment"])
+            rev = int(msg["revision"])
+            final = bool(msg.get("final", False))
+            item = {
+                "type": "CAPTION_UPDATE",
+                "session": msg.get("session"),
+                "segment": seg,
+                "revision": rev,
+                "source_ts": float(msg["source_ts"]),
+                "final": final,
+                "text": str(msg.get("text", "")),
+            }
+        except (KeyError, TypeError, ValueError):
+            self.updates_ignored += 1
+            return
+
+        if seg < 1 or rev < 1:
+            self.updates_ignored += 1
+            return
+
+        known = self.segment_state.get(seg)
+        if known is not None:
+            known_rev, known_final = known
+            if known_final or rev <= known_rev: # ignore duplicates/stale updates
+                self.updates_ignored += 1 
+                return
+        # perform update
+        self.segment_state[seg] = (rev, final)
+        self.segment_state.move_to_end(seg)
+
+        while len(self.segment_state) > SEGMENT_STATE_MAX:
+            self.segment_state.popitem(last=False)
+
+        self.updates_in += 1
+        raw = json.dumps(item, separators=(",",":"))
+        now = time.time()
+
+        if final:
+            self.history.append((now, seg, rev, item))
+            self.prune_history(now)
+            if self.active is not None and self.active[0] <= seg:
+                self.active = None
+        elif self.active is None or seg >= self.active[0]:
+            self.active = (seg, rev, raw)
+
+        slow = [c for c in self.clients if not c.enqueue(seg, raw, final)]
+        for client in slow:
+            self.drop_slowpoke(client)
+
+    def prune_history(self, now: float) -> None:
+        cutoff = now - MASTER_HISTORY_SECONDS
+        h = self.history
+        while h and (h[0][0] < cutoff or len(h) > HISTORY_MAX_ITEMS):
+            h.popleft()
+
+    # client-side
+    
 
 # to be deleted
 async def broadcast_naively(raw_message: str) -> None:
