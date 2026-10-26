@@ -1,7 +1,9 @@
 /*
  * store.js - LiveRecall caption state (no network code, no DOM code).
+ *
  * The store keeps ONE entry per caption segment:
  *     segment -> { segment, revision, final, text, source_ts, recovered }
+ *
  * Core rule (used for live updates AND recovered HISTORY items):
  *   1. If we already hold the FINAL for this segment  -> ignore the update.
  *        (finals are durable; this also blocks duplicate finals after reconnect)
@@ -49,8 +51,20 @@
     apply(update, { recovered = false } = {}) {
       if (!isValidUpdate(update)) return { changed: false, reason: "invalid" };
  
+      // Lecture restarted (caption source / server restarted): segment numbers
+      // start again from 1. Without this check every new caption would look
+      // "old" and be ignored, freezing the page on the previous lecture.
+      let restarted = false;
+      if (!recovered && this.isRestart(update)) {
+        this.reset();
+        restarted = true;
+      }
+ 
       const seg = update.segment;
       const held = this.segments.get(seg);
+ 
+      // Live updates move the lecture clock forward (after the restart check).
+      if (!recovered) this.observeClock(update.source_ts);
  
       // Already pruned out of our window: don't resurrect it.
       if (!held && seg <= this.prunedUpTo) return { changed: false, reason: "too-old" };
@@ -77,9 +91,28 @@
       }
  
       let reason;
-      if (!held) reason = entry.final ? "finalized" : "new";
+      if (restarted) reason = "restart";
+      else if (!held) reason = entry.final ? "finalized" : "new";
       else reason = entry.final ? "finalized" : "revised";
       return { changed: true, reason };
+    }
+ 
+    /**
+     * A live update means "new lecture" when BOTH are true:
+     *   - its segment number is lower than the newest segment we hold, and we
+     *     can't accept it normally (we hold its final, or it was pruned), and
+     *   - its source_ts is NEWER than anything we've seen.
+     * The timestamp check matters: a server may legitimately deliver segment
+     * N's final just after segment N+1's first revision, but that final is
+     * OLDER in time, so it is not mistaken for a restart.
+     */
+    isRestart(update) {
+      if (this.clockSourceTs === null || this.segments.size === 0) return false;
+      if (Number(update.source_ts) <= this.clockSourceTs) return false;
+      const newest = Math.max(this.lastFinalSegment, ...this.segments.keys());
+      if (update.segment >= newest) return false;
+      const held = this.segments.get(update.segment);
+      return !held || held.final;
     }
  
     /**
@@ -198,3 +231,4 @@
   if (typeof module === "object" && module.exports) module.exports = api; // Node tests
   else root.LiveRecallStore = api;                                         // browser
 })(typeof globalThis !== "undefined" ? globalThis : this);
+ 

@@ -119,6 +119,34 @@ test("gap markers show where segments could not be recovered", () => {
   assert.equal(s.viewRows().some((r) => r.gap), false);
 });
 
+test("lecture restart (segments back to 1, newer time) resets the store", () => {
+  const s = new CaptionStore();
+  for (let i = 1; i <= 50; i++) s.apply(upd(i, 1, true, `old ${i}`, T0 + i));
+  // Caption source restarted: segment 1 again, but later in time.
+  const r = s.apply(upd(1, 1, false, "new lecture", T0 + 500));
+  assert.equal(r.reason, "restart");
+  assert.deepEqual(s.ordered().map((e) => e.text), ["new lecture"]);
+  assert.deepEqual(s.resumeState(), { last_segment: 0, last_revision: 0 });
+  s.apply(upd(1, 2, true, "new lecture begins.", T0 + 501));
+  assert.deepEqual(s.resumeState(), { last_segment: 1, last_revision: 2 });
+});
+
+test("late final of the previous segment is NOT mistaken for a restart", () => {
+  const s = new CaptionStore();
+  s.apply(upd(7, 1, false, "seven so far", T0 + 70));
+  s.apply(upd(8, 1, false, "eight starts", T0 + 80));   // server sent N+1 first
+  const r = s.apply(upd(7, 3, true, "seven done.", T0 + 75)); // older timestamp
+  assert.equal(r.reason, "finalized");
+  assert.equal(s.ordered().length, 2);
+});
+
+test("HISTORY items never trigger a restart", () => {
+  const s = new CaptionStore();
+  for (let i = 1; i <= 10; i++) s.apply(upd(i, 1, true, `s${i}`, T0 + i));
+  s.mergeHistory([upd(2, 1, true, "s2", T0 + 999)]);
+  assert.equal(s.ordered().length, 10);
+});
+
 test("invalid messages are rejected", () => {
   const s = new CaptionStore();
   assert.equal(s.apply({ segment: 0, revision: 1, source_ts: T0 }).reason, "invalid");

@@ -71,6 +71,14 @@
     statusText.textContent = text;
   }
  
+  // Screen readers: the live area is NOT aria-live (it would read every
+  // revision: "TCP uses", "TCP uses cumulative", ...). Instead, each FINAL
+  // caption is announced once through this hidden region.
+  const srEl = $("sr-announce");
+  function announce(text) {
+    srEl.textContent = text;
+  }
+ 
   let toastTimer = null;
   function toast(message) {
     toastEl.textContent = message;
@@ -164,10 +172,16 @@
     if (msg.session && msg.session !== SESSION) return;
  
     if (msg.type === "CAPTION_UPDATE") {
-      store.observeClock(msg.source_ts);
-      const result = store.apply(msg);
+      const result = store.apply(msg);          // also advances the lecture clock
       if (result.changed) {
-        if (result.reason === "finalized") justFinalized.add(msg.segment);
+        if (result.reason === "restart") {
+          justFinalized.clear();
+          toast("A new lecture started · captions reset");
+        }
+        if (msg.final === true) {
+          justFinalized.add(msg.segment);
+          announce(msg.text);                    // screen readers hear finals only
+        }
         queueRender();
       } else {
         stats.ignored++;
@@ -323,3 +337,4 @@
  
   connect();
 })();
+ 
