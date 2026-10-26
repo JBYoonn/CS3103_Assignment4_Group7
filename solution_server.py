@@ -27,14 +27,35 @@ import argparse
 import asyncio
 import json
 from typing import Any
+from collections import OrderedDict, deque
 
 import websockets
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+
+# Bounds
+MAX_HISTORY_SECONDS = 60
+MASTER_HISTORY_SECONDS = 120
+CLIENT_MAX_PENDING = 128
 
 
+class Client:
+    """State of one client"""
+    __slots__ = ("ws", "client_id", "pending", "wakeup", "sender", "sent", "coalesced", "closing")
+
+    def __init__(self, ws, client_id: Any) -> None:
+        self.ws = ws
+        self.client_id = client_id
+
+        # key->(msg,is_final), where key is segment number + "HISTORY" for initial history
+        self.pending: OrderedDict[Any, tuple[str, bool]] = OrderedDict()
+        self.wakeup = asyncio.Event()
+        self.sender: asyncio.Task | None = None
+        self.sent = 0
+        self.coalesced = 0
+        self.closing = False
+
+
+# to be deleted
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
 
