@@ -41,6 +41,8 @@ MAX_UNACKED_PINGS = 1
 PING_EVERY = 4
 SEGMENT_STATE_MAX = 2048
 HISTORY_MAX_ITEMS = 2048
+STATS_INTERVAL = 10.0
+
 
 def _newer(seg: int, rev: int, base_seg: int, base_rev: int) -> bool:
     return seg > base_seg or (seg == base_seg and rev > base_rev)
@@ -201,7 +203,56 @@ class LiveRecallServer:
             h.popleft()
 
     # client-side
-    
+    def history_for(self, last_seg: int, last_rev: int, seconds: float) -> list[dict]:
+        now = time.time()
+        self.prune_history(now) # update history to remove stale entries
+        cutoff = now - seconds
+        return [item for (t,seg,rev,item) in self.history if t >= cutoff and _newer(seg, rev, last_seg, last_rev)]
+
+    def register(self, client: Client, last_seg: int, last_rev: int, seconds: float) -> int:
+        items = self.history_for(last_seg, last_rev, seconds)
+        client.pending["HISTORY"] = (
+            json.dumps({"type": "HISTORY", "items": items}, separators=(",",":")),
+            True,
+        )
+        if self.active is not None:
+            seg, rev, raw = self.active
+            if _newer(seg, rev, last_seg, last_rev):
+                client.pending[seg] = (raw, False)
+
+        client.wakeup.set()
+        self.clients.add(client)
+        return len(items)
+
+    def drop_slowpokes(self, client: Client) -> None:
+        if client.closing:
+            return
+
+        client.closing = True
+        self.clients.discard(client)
+        client.pending.clear()
+        self.slow_disconnects += 1
+
+        print(f"client {client.client_id} is too slow, disconnecting", flush=True)
+
+        if client.sender is not None:
+            client.sender.cancel()
+        asyncio.get_running_loop().create_task(
+            client.ws.close(code=1013, reason="client too slow"))
+
+    async def stats_loop(self) -> None:
+        while True:
+            await asyncio.sleep(STATS_INTERVAL)
+            if not self.clients and not self.updates_in:
+                continue
+            backlog = max((len(c.pending) for c in self.clients), default=0)
+            print(f"[stats] clients={len(self.clients)} updates={self.updates_in} "
+                  f"ignored={self.updates_ignored} history={len(self.history)} "
+                  f"max_backlog={backlog} slow_drops={self.slow_disconnects}",
+                  flush=True)
+
+
+STATE = LiveRecallServer()
 
 # to be deleted
 async def broadcast_naively(raw_message: str) -> None:
