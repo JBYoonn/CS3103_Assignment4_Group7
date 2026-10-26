@@ -38,6 +38,12 @@ MASTER_HISTORY_SECONDS = 120
 CLIENT_MAX_PENDING = 128
 LAG_SECONDS = 1.0
 MAX_UNACKED_PINGS = 1
+PING_EVERY = 4
+
+
+def _newer(seg: int, rev: int, base_seg: int, base_rev: int) -> bool:
+    return seg > base_seg or (seg == base_seg and rev > base_rev)
+
 
 class Client:
     """State of one client"""
@@ -84,7 +90,7 @@ class Client:
             while True:
                 while waiters and waiters[0][1].done():
                     waiters.popleft()
-                    
+
                 lagging = bool(waiters) and time.monotonic() - waiters[0][0] > LAG_SECONDS
                 key = self._next_key(finals_only=lagging)
 
@@ -102,7 +108,7 @@ class Client:
                 await self.ws.send(raw)
                 self.sent += 1
                 since_ping += 1
-                if since_ping > MAX_UNACKED_PINGS:
+                if since_ping > PING_EVERY:
                     since_ping = 0
                     waiters.append((time.monotonic(), await self.ws.ping()))
                     while len(waiters) > MAX_UNACKED_PINGS:
