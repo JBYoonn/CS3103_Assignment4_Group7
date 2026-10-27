@@ -9,15 +9,19 @@
  *     built only from captions already held locally
  *   - reconnect automatically with backoff and show connection state
  *
+ * Server address: same host as the page, port 8765 (so serving the client
+ * from the Ubuntu VM and opening it on the laptop just works).
  * URL overrides (handy for the demo / Ubuntu VM):
  *   index.html?server=ws://192.168.64.5:8765&session=L1
  */
 (function () {
   "use strict";
- 
+
   // ---------- Configuration ----------
   const params = new URLSearchParams(location.search);
-  const WS_URL = params.get("server") || "ws://127.0.0.1:8765";
+  // "localhost" may resolve to IPv6 (::1) while the server listens on IPv4 only.
+  const PAGE_HOST = location.hostname && location.hostname !== "localhost" ? location.hostname : "127.0.0.1";
+  const WS_URL = params.get("server") || `ws://${PAGE_HOST}:8765`;
   const SESSION = params.get("session") || "L1";
   const HISTORY_REQUEST_SECONDS = 60;      // max the brief allows in CLIENT_HELLO
   const RECALL_DEFAULT_SECONDS = 30;       // brief: "initially display the previous 30 seconds"
@@ -25,6 +29,7 @@
   const RECONNECT_MAX_MS = 5000;
   const SIMULATED_DROP_MS = 8000;
   const PRUNE_EVERY_MS = 2000;
+  const PARTIAL_SLACK_SECONDS = 3;         // gaps between captions this small don't count as "partial"
  
   // ---------- State ----------
   const store = new LiveRecallStore.CaptionStore(); // 90 s window (store.js)
@@ -35,6 +40,7 @@
   let countdownTimer = null;
   let pausedUntil = 0;          // used by "Simulate network drop"
   let recallSeconds = RECALL_DEFAULT_SECONDS;
+  let recallKey = null;         // which captions the recall list currently shows
   let renderQueued = false;
   const justFinalized = new Set();
   const stats = { reconnects: 0, recovered: 0, ignored: 0 };
@@ -50,7 +56,9 @@
   const recallMeta = $("recall-meta");
   const layout = document.querySelector(".layout");
   const toastEl = $("toast");
- 
+  const retryBtn = $("retry");
+  const missBtn = $("miss-btn");
+
   $("session-label").textContent = `Session ${SESSION}`;
   $("d-server").textContent = WS_URL;
  
@@ -69,6 +77,7 @@
   function setStatus(state, text) {
     statusEl.dataset.state = state;
     statusText.textContent = text;
+    retryBtn.hidden = !(state === "reconnecting" || state === "offline");
   }
  
   // Screen readers: the live area is NOT aria-live (it would read every
@@ -93,7 +102,10 @@
     clearInterval(countdownTimer);
     setStatus(everConnected ? "reconnecting" : "connecting",
               everConnected ? "Reconnecting…" : "Connecting…");
- 
+
+    // "Retry now" can be pressed while an attempt is still opening: drop it.
+    if (ws) { const old = ws; ws = null; try { old.close(); } catch (_) { /* already closed */ } }
+
     let sock;
     try {
       sock = new WebSocket(WS_URL);
@@ -106,7 +118,7 @@
  
     sock.addEventListener("open", () => {
       if (sock !== ws) return; // an older socket; ignore
-      setStatus("connected", "Live");
+      setStatus("syncing", "Syncing…");   // "Live" once HISTORY has been merged
       const hello = {
         type: "CLIENT_HELLO",
         client_id: numericClientId(),
@@ -161,6 +173,13 @@
     countdownTimer = setInterval(showCountdown, 500);
     reconnectTimer = setTimeout(connect, delay);
   }
+
+  // Skip the backoff (and any simulated drop) and try straight away.
+  retryBtn.addEventListener("click", () => {
+    pausedUntil = 0;
+    reconnectAttempts = 0;
+    connect();
+  });
  
   // Network came back: don't wait for the backoff timer.
   window.addEventListener("online", () => {
@@ -172,10 +191,13 @@
     if (msg.session && msg.session !== SESSION) return;
  
     if (msg.type === "CAPTION_UPDATE") {
+      // Fallback if a server streams captions without sending HISTORY first.
+      if (statusEl.dataset.state === "syncing") setStatus("connected", "Live");
       const result = store.apply(msg);          // also advances the lecture clock
       if (result.changed) {
         if (result.reason === "restart") {
           justFinalized.clear();
+          recallKey = null;            // segment numbers restart, so force a rebuild
           toast("A new lecture started · captions reset");
         }
         if (msg.final === true) {
@@ -189,11 +211,13 @@
       }
     } else if (msg.type === "HISTORY") {
       const items = Array.isArray(msg.items) ? msg.items : [];
-      const added = store.mergeHistory(items);
+      // Only a reconnect "recovers" captions; a late join just loads context.
+      const added = store.mergeHistory(items, { recovered: everConnected });
       stats.recovered += added;
       stats.ignored += items.length - added;
       reconnectAttempts = 0; // server answered properly; reset backoff
- 
+      setStatus("connected", "Live");
+
       if (!everConnected) {
         toast(added > 0 ? `Joined late · loaded ${added} recent caption${added === 1 ? "" : "s"}`
                         : "Connected · waiting for captions");
@@ -205,7 +229,10 @@
       everConnected = true;
       queueRender();
     }
-    // Any other message type (e.g. future extensions) is ignored safely.
+    // The client relies only on the required protocol (handout §4.2):
+    // HISTORY and CAPTION_UPDATE. Any other message type a server may add is
+    // ignored, and a new lecture is detected from the captions themselves
+    // (store.isRestart), so the client works with any compliant server.
   }
  
   // ---------- Rendering ----------
@@ -274,12 +301,16 @@
     recallSeconds = seconds;
     recallPanel.hidden = false;
     layout.classList.add("with-recall");
+    missBtn.setAttribute("aria-expanded", "true");
+    recallKey = null;              // fresh list, read from the oldest caption down
     renderRecall();
+    recallList.scrollTop = 0;
   }
- 
+
   function closeRecall() {
     recallPanel.hidden = true;
     layout.classList.remove("with-recall");
+    missBtn.setAttribute("aria-expanded", "false");
   }
  
   function renderRecall() {
@@ -288,29 +319,76 @@
     }
     const now = store.lectureNow();
     const items = store.recall(recallSeconds, now);   // local data only, no server request
- 
-    recallMeta.textContent = items.length
-      ? `Last ${recallSeconds} s · ${items.length} caption${items.length === 1 ? "" : "s"}`
-      : `Nothing finalized in the last ${recallSeconds} s.`;
- 
+    const agoText = (e) => `${Math.max(0, Math.round(now - e.source_ts))} s ago${e.recovered ? " · recovered" : ""}`;
+
+    // Joined recently (or the lecture just started): say the window is partial
+    // instead of implying nothing was said earlier.
+    const available = items.length ? Math.round(now - items[0].source_ts) : 0;
+    const partial = items.length > 0 && available < recallSeconds - PARTIAL_SLACK_SECONDS &&
+                    !store.hasFinalBefore(now - recallSeconds);
+    recallMeta.textContent = !items.length
+      ? `Nothing finalized in the last ${recallSeconds} s.`
+      : `Last ${recallSeconds} s · ${items.length} caption${items.length === 1 ? "" : "s"}` +
+        (partial ? ` · only ${available} s available so far` : "");
+
+    // Same captions as last time: just move the "s ago" labels, keep the DOM
+    // (and the reader's scroll position) untouched.
+    const key = items.map((e) => `${e.segment}${e.recovered ? "r" : ""}`).join(",");
+    if (key === recallKey) {
+      items.forEach((e, i) => { recallList.children[i].firstChild.textContent = agoText(e); });
+      return;
+    }
+    recallKey = key;
+
+    // Content changed (new final at the bottom, old one slid off the top).
+    // Anchor on the first visible caption so the text being read doesn't jump.
+    const atBottom = recallList.scrollHeight - recallList.scrollTop - recallList.clientHeight < 40;
+    const listTop = recallList.getBoundingClientRect().top;
+    let anchorSeg = null, anchorOffset = 0;
+    for (const li of recallList.children) {
+      const top = li.getBoundingClientRect().top - listTop;
+      if (top + li.offsetHeight > 0) { anchorSeg = li.dataset.segment; anchorOffset = top; break; }
+    }
+
     const frag = document.createDocumentFragment();
     for (const e of items) {
       const li = document.createElement("li");
+      li.dataset.segment = e.segment;
       const ago = document.createElement("span");
       ago.className = "ago";
-      ago.textContent = `${Math.max(0, Math.round(now - e.source_ts))} s ago${e.recovered ? " · recovered" : ""}`;
+      ago.textContent = agoText(e);
       li.append(ago, document.createTextNode(e.text));
       frag.appendChild(li);
     }
     recallList.replaceChildren(frag);
+
+    if (atBottom) {
+      recallList.scrollTop = recallList.scrollHeight;
+    } else if (anchorSeg !== null) {
+      const li = recallList.querySelector(`[data-segment="${anchorSeg}"]`);
+      if (li) recallList.scrollTop += (li.getBoundingClientRect().top - listTop) - anchorOffset;
+    }
   }
- 
-  $("miss-btn").addEventListener("click", () => openRecall(RECALL_DEFAULT_SECONDS));
-  $("recall-close").addEventListener("click", closeRecall);
+
+  function toggleRecall() {
+    if (recallPanel.hidden) openRecall(RECALL_DEFAULT_SECONDS);
+    else closeRecall();
+  }
+
+  missBtn.addEventListener("click", toggleRecall);
+  $("recall-close").addEventListener("click", () => { closeRecall(); missBtn.focus(); });
   for (const tab of recallPanel.querySelectorAll("[data-seconds]")) {
     tab.addEventListener("click", () => openRecall(Number(tab.dataset.seconds)));
   }
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeRecall(); });
+  // Keyboard: M toggles "What did I miss?", Escape closes it.
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey || e.repeat || e.isComposing) return;
+    const t = e.target;
+    if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement ||
+        t instanceof HTMLSelectElement || t.isContentEditable) return;   // typing, not a shortcut
+    if (e.key === "Escape" && !recallPanel.hidden) { closeRecall(); missBtn.focus(); }
+    if (e.key === "m" || e.key === "M") toggleRecall();
+  });
  
   // ---------- Stats / demo tools ----------
   function renderStats() {

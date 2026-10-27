@@ -105,11 +105,13 @@
      * The timestamp check matters: a server may legitimately deliver segment
      * N's final just after segment N+1's first revision, but that final is
      * OLDER in time, so it is not mistaken for a restart.
+     * prunedUpTo is included so a restart is still seen after a long pause
+     * has pruned the store empty (otherwise segment 1 would be "too-old").
      */
     isRestart(update) {
-      if (this.clockSourceTs === null || this.segments.size === 0) return false;
+      if (this.clockSourceTs === null) return false;
       if (Number(update.source_ts) <= this.clockSourceTs) return false;
-      const newest = Math.max(this.lastFinalSegment, ...this.segments.keys());
+      const newest = Math.max(this.lastFinalSegment, this.prunedUpTo, ...this.segments.keys());
       if (update.segment >= newest) return false;
       const held = this.segments.get(update.segment);
       return !held || held.final;
@@ -120,8 +122,9 @@
      * Items are applied oldest -> newest through the same apply() rule, so
      * anything we already hold is skipped and nothing is shown twice.
      * Returns the number of captions actually added/replaced.
+     * recovered=false for a late join (that is context, not something we lost).
      */
-    mergeHistory(items) {
+    mergeHistory(items, { recovered = true } = {}) {
       if (!Array.isArray(items)) return 0;
       const sorted = items
         .filter((it) => it && it.final === true)
@@ -129,7 +132,7 @@
         .sort((a, b) => a.segment - b.segment);
       let added = 0;
       for (const item of sorted) {
-        if (this.apply(item, { recovered: true }).changed) added++;
+        if (this.apply(item, { recovered }).changed) added++;
       }
       // Late join with no live update yet: start the lecture clock from history.
       if (this.clockSourceTs === null && sorted.length > 0) {
@@ -215,6 +218,12 @@
       if (now === null) return [];
       const from = now - seconds;
       return this.ordered().filter((e) => e.final && e.source_ts >= from);
+    }
+
+    /** True if we hold a final older than `ts`, i.e. a recall window starting at ts is complete. */
+    hasFinalBefore(ts) {
+      for (const e of this.segments.values()) if (e.final && e.source_ts < ts) return true;
+      return false;
     }
   }
  

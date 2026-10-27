@@ -66,8 +66,13 @@ h1, h2 { margin: 0; }
 .status .dot { width: .6rem; height: .6rem; border-radius: 50%; background: var(--muted); }
 .status[data-state="connected"] .dot { background: var(--ok); }
 .status[data-state="connecting"] .dot,
+.status[data-state="syncing"] .dot,
 .status[data-state="reconnecting"] .dot { background: var(--warn); animation: pulse 1s infinite; }
 .status[data-state="offline"] .dot { background: var(--bad); }
+.link-btn {
+  border: 0; background: none; padding: 0; margin-left: .25rem;
+  color: var(--accent); font-weight: 600; font-size: inherit; text-decoration: underline;
+}
 @keyframes pulse { 50% { opacity: .3; } }
  
 /* Layout */

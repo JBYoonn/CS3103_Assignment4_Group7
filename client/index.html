@@ -15,6 +15,7 @@
     <div class="status" id="status" data-state="connecting" role="status" aria-live="polite">
       <span class="dot" aria-hidden="true"></span>
       <span id="status-text">Connecting…</span>
+      <button id="retry" class="link-btn" hidden>Retry now</button>
     </div>
   </header>
  
@@ -34,7 +35,7 @@
  
       <button id="jump-latest" class="jump" hidden>↓ Jump to latest</button>
  
-      <button id="miss-btn" class="miss-btn">What did I miss?</button>
+      <button id="miss-btn" class="miss-btn" aria-controls="recall-panel" aria-expanded="false" title="Shortcut: M">What did I miss?</button>
     </section>
  
     <aside id="recall-panel" class="recall-panel" aria-label="What did I miss?" hidden>

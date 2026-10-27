@@ -147,6 +147,78 @@ test("HISTORY items never trigger a restart", () => {
   assert.equal(s.ordered().length, 10);
 });
 
+test("restart is detected even after pruning emptied the store", () => {
+  const s = new CaptionStore();
+  for (let i = 1; i <= 20; i++) s.apply(upd(i, 1, true, `old ${i}`, T0 + i));
+  s.prune(T0 + 300);                        // long pause: everything pruned
+  assert.equal(s.ordered().length, 0);
+  const r = s.apply(upd(1, 1, false, "new lecture", T0 + 400));
+  assert.equal(r.reason, "restart");
+  assert.deepEqual(s.ordered().map((e) => e.text), ["new lecture"]);
+  assert.deepEqual(s.resumeState(), { last_segment: 0, last_revision: 0 });
+});
+
+test("late-join HISTORY is not tagged as recovered", () => {
+  const s = new CaptionStore();
+  s.mergeHistory([upd(1, 2, true, "a"), upd(2, 2, true, "b")], { recovered: false });
+  assert.ok(s.ordered().every((e) => e.recovered === false));
+});
+
+test("reconnect HISTORY is tagged as recovered", () => {
+  const s = new CaptionStore();
+  s.apply(upd(1, 2, true, "a"));
+  s.mergeHistory([upd(2, 2, true, "b")], { recovered: true });
+  assert.deepEqual(s.ordered().map((e) => e.recovered), [false, true]);
+});
+
+test("reconnect HISTORY followed by normal live updates is never a restart", () => {
+  const s = new CaptionStore();
+  for (let i = 1; i <= 20; i++) s.apply(upd(i, 1, true, `s${i}`, T0 + i));
+  s.prune(T0 + 200);                                     // long offline: store pruned empty
+  s.mergeHistory([21, 22, 23, 24, 25].map((i) => upd(i, 1, true, `s${i}`, T0 + i)), { recovered: true });
+  const reasons = [
+    s.apply(upd(26, 1, false, "s26 draft", T0 + 26)).reason,
+    s.apply(upd(26, 2, true, "s26.", T0 + 26.5)).reason,
+    s.apply(upd(27, 1, false, "s27", T0 + 27)).reason,
+  ];
+  assert.ok(!reasons.includes("restart"), reasons.join(","));
+  assert.deepEqual(s.ordered().map((e) => e.segment), [21, 22, 23, 24, 25, 26, 27]);
+});
+
+test("a pruned segment arriving late (older time) is too-old, not a restart", () => {
+  const s = new CaptionStore();
+  for (let i = 1; i <= 20; i++) s.apply(upd(i, 1, true, `s${i}`, T0 + i));
+  s.prune(T0 + 200);
+  assert.equal(s.apply(upd(5, 2, true, "late", T0 + 5)).reason, "too-old");
+});
+
+test("newer segment after pruning is accepted normally", () => {
+  const s = new CaptionStore();
+  for (let i = 1; i <= 20; i++) s.apply(upd(i, 1, true, `s${i}`, T0 + i));
+  s.prune(T0 + 200);
+  assert.equal(s.apply(upd(21, 1, false, "next", T0 + 201)).reason, "new");
+});
+
+test("mergeHistory tags items as recovered by default", () => {
+  const s = new CaptionStore();
+  s.mergeHistory([upd(1, 1, true, "a")]);
+  assert.equal(s.ordered()[0].recovered, true);
+});
+
+test("hasFinalBefore ignores provisionals and an empty store", () => {
+  const s = new CaptionStore();
+  assert.equal(s.hasFinalBefore(T0 + 100), false);
+  s.apply(upd(1, 1, false, "draft", T0 + 1));
+  assert.equal(s.hasFinalBefore(T0 + 100), false);
+});
+
+test("hasFinalBefore tells a full recall window from a partial one", () => {
+  const s = new CaptionStore();
+  for (let i = 50; i <= 70; i++) s.apply(upd(i, 1, true, `s${i}`, T0 + i)); // joined at T0+50
+  assert.equal(s.hasFinalBefore(T0 + 70 - 15), true);   // 15 s window fully covered
+  assert.equal(s.hasFinalBefore(T0 + 70 - 60), false);  // 60 s window only partly held
+});
+
 test("invalid messages are rejected", () => {
   const s = new CaptionStore();
   assert.equal(s.apply({ segment: 0, revision: 1, source_ts: T0 }).reason, "invalid");
