@@ -1,24 +1,59 @@
 #!/usr/bin/env python3
 """
-CS3103 Assignment 4 - LiveRecall naive working baseline.
-
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
-
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
+CS3103 Assignment 4 - LiveRecall server.
 
 Required evaluator command:
     python solution_server.py --port 8765
 
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
+Design overview
+---------------
+Source side
+  * One source connection sends CAPTION_UPDATE messages. The server keeps the
+    newest accepted revision of every recent segment and ignores stale or
+    duplicate revisions (an older revision never overwrites a newer one, and
+    nothing overwrites a final). A finalized-segment watermark also rejects
+    old updates after their revision entries have been evicted. The source
+    completes segments in increasing order, as in caption_source.py.
+  * Each accepted update is JSON-encoded once and the same string is handed to
+    every client without per-client serialization.
+
+Bounded recovery history
+  * Finalized captions are kept in a deque bounded both by age
+    (HISTORY_KEEP_SECONDS, comfortably above the 60 s the protocol allows a
+    client to ask for) and by count (HISTORY_MAX_ITEMS). Nothing else about the
+    lecture is retained.
+
+Per-client delivery
+  * Every client has its own pending map (segment -> newest encoded update)
+    drained by its own sender task. The source handler never awaits a client
+    send, so a slow client cannot delay the source or other clients.
+  * Semantic coalescing happens naturally in the pending map: if a client is
+    still behind when a newer revision of the same segment arrives, the newer
+    revision replaces the waiting provisional one in place. A final is never
+    replaced while queued. Overflow closes the connection and recovery is
+    limited to the retained history window. Under normal load the map is empty
+    when each new revision arrives, so clients see every revision.
+  * The map is bounded (CLIENT_MAX_PENDING segments). A client that falls
+    that far behind is disconnected with code 1013; it reconnects and resumes
+    from its last finalized caption via HISTORY, which is bounded too.
+  * Ping-based flow control (see Client.run_sender) limits how much is in
+    flight to each client. Delayed pongs prioritize finals, but don't prove
+    that the client application has processed or displayed captions.
+  * The kernel send buffer and the websockets write buffer are kept small so
+    that backpressure shows up in the pending map (where it can be
+    coalesced) instead of hiding megabytes of stale data in socket buffers.
+
+Client handshake
+  * On CLIENT_HELLO the server takes the HISTORY snapshot and registers the
+    client in one synchronous step (no await in between), so no live update
+    can be missed or duplicated between HISTORY and the live stream.
+  * HISTORY holds finalized captions newer than (last_segment, last_revision)
+    received within the last history_seconds (capped at 60), oldest first.
+    If a segment is currently in progress, its newest provisional revision is
+    queued right after HISTORY so a late joiner sees the current sentence.
+  * One session is selected by the first valid hello, with one active source.
+    Restart the server for a new lecture; a reconnecting source must continue
+    its segment numbering rather than restart from segment 1.
 """
 
 from __future__ import annotations
@@ -26,39 +61,46 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from typing import Any
-from collections import OrderedDict, deque
-import time
-import websockets
-from websockets.exceptions import ConnectionClosed
+import logging
+import math
 import socket
+import time
+from collections import OrderedDict, deque
+from contextlib import suppress
+from typing import Any
 
-# Bounds
-MAX_HISTORY_SECONDS = 60
-MASTER_HISTORY_SECONDS = 120
-CLIENT_MAX_PENDING = 128
-LAG_SECONDS = 1.0
-MAX_UNACKED_PINGS = 1
-PING_EVERY = 4
-SEGMENT_STATE_MAX = 2048
-HISTORY_MAX_ITEMS = 2048
-STATS_INTERVAL = 10.0
-CLIENT_SNDBUF = 32 * 1024
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed
+
+# ---- Tunable bounds -------------------------------------------------------
+MAX_HISTORY_SECONDS = 60          # protocol maximum for history_seconds
+HISTORY_KEEP_SECONDS = 90         # retained window (a bit above 60 s)
+HISTORY_MAX_ITEMS = 2000          # hard cap even if the source is very bursty
+SEGMENT_STATE_MAX = 4096          # recent segments whose revision we remember
+CLIENT_MAX_PENDING = 256          # segments waiting for one client
+CLIENT_SNDBUF_BYTES = 32 * 1024   # kernel send buffer per client socket
+WRITE_LIMIT_BYTES = 16 * 1024     # websockets user-space write buffer
+PING_EVERY = 4                    # messages between flow-control pings
+MAX_UNACKED_PINGS = 1             # gate sending on outstanding transport pings
+LAG_SECONDS = 1.0                 # unanswered ping older than this = lagging
+STATS_INTERVAL = 10.0             # seconds between status log lines
 
 
-def _newer(seg: int, rev: int, base_seg: int, base_rev: int) -> bool:
+def _seg_rev_newer(seg: int, rev: int, base_seg: int, base_rev: int) -> bool:
     return seg > base_seg or (seg == base_seg and rev > base_rev)
 
 
 class Client:
-    """State of one client"""
-    __slots__ = ("ws", "client_id", "pending", "wakeup", "sender", "sent", "coalesced", "closing")
+    """Delivery state for one connected student client."""
+
+    __slots__ = ("ws", "client_id", "pending", "wakeup", "sender",
+                 "sent", "coalesced", "closing")
 
     def __init__(self, ws, client_id: Any) -> None:
         self.ws = ws
         self.client_id = client_id
-
-        # key->(msg,is_final), where key is segment number + "HISTORY" for initial history
+        # key -> (encoded message, is_final). Keys are segment numbers, plus
+        # the string "HISTORY" for the initial history reply.
         self.pending: OrderedDict[Any, tuple[str, bool]] = OrderedDict()
         self.wakeup = asyncio.Event()
         self.sender: asyncio.Task | None = None
@@ -67,12 +109,12 @@ class Client:
         self.closing = False
 
     def enqueue(self, key: Any, raw: str, final: bool) -> bool:
-        """Queues one msg. Return false if client is too far behind"""
+        """Queue one message. Returns False if the client is hopelessly behind."""
         waiting = self.pending.get(key)
         if waiting is not None:
             if waiting[1]:
-                return True # a final was queued
-            self.pending[key] = (raw, final)
+                return True               # a final is already queued: keep it
+            self.pending[key] = (raw, final)   # replace in place (keeps order)
             self.coalesced += 1
         else:
             if len(self.pending) >= CLIENT_MAX_PENDING:
@@ -82,27 +124,34 @@ class Client:
         return True
 
     async def run_sender(self) -> None:
-        """Empty pending map.
-        
-        After every ping via WebSocket ping. If more than MAX_UNACKED_PINGS are unanswered,
-        we stop sending and wait. This will limit the amount of traffic to the slower client,
-        while the pending map fills up, where it will coalesced with newer segments.
-        A client whose oldest unanswered ping is older than LAG_SECONDS is only sent finals.
+        """Drain the pending map with ping-based flow control.
+
+        After every PING_EVERY messages we send a WebSocket ping. A delayed
+        pong signals transport lag; it isn't an application acknowledgement.
+        If more than MAX_UNACKED_PINGS are unanswered we stop sending and wait.
+        Waiting updates remain in our pending map, where they can be coalesced.
+        The receiving WebSocket stack may already have buffered earlier data.
+        A client whose oldest unanswered ping is
+        older than LAG_SECONDS is sent finals first (see below).
         """
-        waiters: deque[tuple[float, asyncio.Future]] = deque() # (send_at, pong)
+        waiters: deque[tuple[float, asyncio.Future]] = deque()   # (sent_at, pong)
         since_ping = 0
         try:
             while True:
                 while waiters and waiters[0][1].done():
                     waiters.popleft()
-
+                # Lagging = the client has not answered a ping sent over
+                # LAG_SECONDS ago. While lagging, send finals only: the
+                # provisional revisions stay queued (and keep being replaced
+                # by newer ones), so the reader's limited bandwidth goes to
+                # durable state and it can catch up.
                 lagging = bool(waiters) and time.monotonic() - waiters[0][0] > LAG_SECONDS
                 key = self._next_key(finals_only=lagging)
 
                 if key is None:
                     if self.pending:
-                        # only provisionals left and client lagging
-                        # wait for client to catch up or new final arrive
+                        # Only provisionals left and the client is lagging:
+                        # wait for it to catch up (or for a new final).
                         await asyncio.wait([waiters[0][1]], timeout=0.1)
                     else:
                         self.wakeup.clear()
@@ -113,7 +162,7 @@ class Client:
                 await self.ws.send(raw)
                 self.sent += 1
                 since_ping += 1
-                if since_ping > PING_EVERY:
+                if since_ping >= PING_EVERY:
                     since_ping = 0
                     waiters.append((time.monotonic(), await self.ws.ping()))
                     while len(waiters) > MAX_UNACKED_PINGS:
@@ -127,66 +176,77 @@ class Client:
             return None
         if not finals_only:
             return next(iter(self.pending))
-        for key, (_raw, final) in self.pending.items(): # finals_only True
+        for key, (_raw, final) in self.pending.items():
             if final:
                 return key
         return None
 
 
 class LiveRecallServer:
-    def __init__(self) -> None:
+    def __init__(self, session: str | None = None) -> None:
+        self.session = session
+        self.source = None
         self.clients: set[Client] = set()
-        # finalized captions -> (server_recv_time, segment, revision, item_dict)
+        # Finalized captions: (server_recv_time, segment, revision, item_dict)
         self.history: deque[tuple[float, int, int, dict]] = deque()
-        # segment -> (revision, final) for recent segments
+        # segment -> (revision, final) for recent segments, for dedup/stale checks
         self.segment_state: OrderedDict[int, tuple[int, bool]] = OrderedDict()
-        # provisional update of the segment currently in progress
-        self.active: tuple[int, int, str] | None = None # (seg, rev, raw)
+        # The protocol source finishes segments in increasing order. Keep this
+        # constant-size guard even when old per-segment entries are evicted.
+        self.last_final_segment = 0
+        # Newest provisional update of the segment currently in progress
+        self.active: tuple[int, int, str] | None = None   # (seg, rev, raw)
         self.updates_in = 0
         self.updates_ignored = 0
         self.slow_disconnects = 0
 
-    # source side
+    # ---- source side ----------------------------------------------------
     def accept_update(self, msg: dict[str, Any]) -> None:
         try:
-            seg = int(msg["segment"])
-            rev = int(msg["revision"])
-            final = bool(msg.get("final", False))
+            seg = msg["segment"]
+            rev = msg["revision"]
+            final = msg["final"]
+            source_ts = msg["source_ts"]
+            if (type(seg) is not int or type(rev) is not int
+                    or type(final) is not bool
+                    or type(source_ts) not in (int, float)
+                    or not math.isfinite(source_ts)
+                    or not isinstance(msg["text"], str)
+                    or msg.get("session") != self.session):
+                raise ValueError("Invalid caption fields or session")
             item = {
                 "type": "CAPTION_UPDATE",
                 "session": msg.get("session"),
                 "segment": seg,
                 "revision": rev,
-                "source_ts": float(msg["source_ts"]),
+                "source_ts": float(source_ts),
                 "final": final,
-                "text": str(msg.get("text", "")),
+                "text": msg["text"],
             }
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             self.updates_ignored += 1
             return
-
-        if seg < 1 or rev < 1:
+        if seg < 1 or rev < 1 or seg <= self.last_final_segment:
             self.updates_ignored += 1
             return
 
         known = self.segment_state.get(seg)
         if known is not None:
             known_rev, known_final = known
-            if known_final or rev <= known_rev: # ignore duplicates/stale updates
-                self.updates_ignored += 1 
+            if known_final or rev <= known_rev:
+                self.updates_ignored += 1   # stale, duplicate, or after final
                 return
-        # perform update
         self.segment_state[seg] = (rev, final)
         self.segment_state.move_to_end(seg)
-
         while len(self.segment_state) > SEGMENT_STATE_MAX:
             self.segment_state.popitem(last=False)
 
         self.updates_in += 1
-        raw = json.dumps(item, separators=(",",":"))
+        raw = json.dumps(item, separators=(",", ":"))
         now = time.time()
 
         if final:
+            self.last_final_segment = seg
             self.history.append((now, seg, rev, item))
             self.prune_history(now)
             if self.active is not None and self.active[0] <= seg:
@@ -194,57 +254,58 @@ class LiveRecallServer:
         elif self.active is None or seg >= self.active[0]:
             self.active = (seg, rev, raw)
 
-        slow = [c for c in self.clients if not c.enqueue(seg, raw, final)]
-        for client in slow:
-            self.drop_slowpoke(client)
+        too_slow = [c for c in self.clients if not c.enqueue(seg, raw, final)]
+        for client in too_slow:
+            self.drop_slow_client(client)
 
     def prune_history(self, now: float) -> None:
-        cutoff = now - MASTER_HISTORY_SECONDS
+        cutoff = now - HISTORY_KEEP_SECONDS
         h = self.history
         while h and (h[0][0] < cutoff or len(h) > HISTORY_MAX_ITEMS):
             h.popleft()
 
-    # client-side
+    # ---- client side ----------------------------------------------------
     def history_for(self, last_seg: int, last_rev: int, seconds: float) -> list[dict]:
         now = time.time()
-        self.prune_history(now) # update history to remove stale entries
+        self.prune_history(now)
         cutoff = now - seconds
-        return [item for (t,seg,rev,item) in self.history if t >= cutoff and _newer(seg, rev, last_seg, last_rev)]
+        return [item for (t, seg, rev, item) in self.history
+                if t >= cutoff and _seg_rev_newer(seg, rev, last_seg, last_rev)]
 
-    def register(self, client: Client, last_seg: int, last_rev: int, seconds: float) -> int:
+    def register(self, client: Client, last_seg: int, last_rev: int,
+                 seconds: float) -> int:
+        """Snapshot HISTORY and start live delivery atomically."""
         items = self.history_for(last_seg, last_rev, seconds)
         client.pending["HISTORY"] = (
-            json.dumps({"type": "HISTORY", "items": items}, separators=(",",":")),
+            json.dumps({"type": "HISTORY", "items": items}, separators=(",", ":")),
             True,
         )
         if self.active is not None:
             seg, rev, raw = self.active
-            if _newer(seg, rev, last_seg, last_rev):
+            if _seg_rev_newer(seg, rev, last_seg, last_rev):
                 client.pending[seg] = (raw, False)
-
         client.wakeup.set()
         self.clients.add(client)
         return len(items)
 
-    def drop_slowpokes(self, client: Client) -> None:
+    def drop_slow_client(self, client: Client) -> None:
         if client.closing:
             return
-
         client.closing = True
         self.clients.discard(client)
         client.pending.clear()
         self.slow_disconnects += 1
-
-        print(f"client {client.client_id} is too slow, disconnecting", flush=True)
-
+        print(f"client {client.client_id} too far behind; disconnecting "
+              f"so it can resume from HISTORY", flush=True)
         if client.sender is not None:
             client.sender.cancel()
         asyncio.get_running_loop().create_task(
-            client.ws.close(code=1013, reason="client too slow"))
+            client.ws.close(code=1013, reason="client too slow; reconnect to resume"))
 
     async def stats_loop(self) -> None:
         while True:
             await asyncio.sleep(STATS_INTERVAL)
+            self.prune_history(time.time())
             if not self.clients and not self.updates_in:
                 continue
             backlog = max((len(c.pending) for c in self.clients), default=0)
@@ -258,96 +319,140 @@ STATE = LiveRecallServer()
 
 
 def _shrink_send_buffer(ws) -> None:
-    """Run once per client.
-    Ensure smaller buffer such that backlog builds up on server-side per-client queue instead.
-    So that newer revisions can replace older ones.
-    """
     sock = ws.transport.get_extra_info("socket") if ws.transport else None
     if sock is None:
         return
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, CLIENT_SNDBUF)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, CLIENT_SNDBUF_BYTES)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
         pass
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
-    session = hello.get("session")
-    print(f"source connected: session={session}", flush=True)
-
+    print(f"source connected: session={hello.get('session')}", flush=True)
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-
+            if not isinstance(msg, dict):
+                continue
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                STATE.accept_update(msg)
             elif msg_type == "SOURCE_DONE":
-                # Test-control message. The specification does not require it
-                # to be forwarded to clients.
                 print("source finished", flush=True)
-            else:
-                # Forward compatibility: ignore fields/messages this baseline
-                # doesn't understand rather than crashing.
-                continue
+            # Anything else is ignored for forward compatibility.
+    except ConnectionClosed:
+        pass
     finally:
+        if STATE.source is ws:
+            STATE.source = None
         print("source disconnected", flush=True)
+
+
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
-
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    last_seg = max(0, _int(hello.get("last_segment")))
+    last_rev = max(0, _int(hello.get("last_revision")))
+    seconds = hello.get("history_seconds", 30)
     try:
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
+        seconds = min(MAX_HISTORY_SECONDS, max(0.0, float(seconds)))
+    except (TypeError, ValueError, OverflowError):
+        seconds = 30.0
+
+    _shrink_send_buffer(ws)
+    client = Client(ws, client_id)
+    n_items = STATE.register(client, last_seg, last_rev, seconds)
+    client.sender = asyncio.create_task(client.run_sender())
+    print(f"client connected: id={client_id} resume={last_seg}/{last_rev} "
+          f"history_items={n_items}; clients={len(STATE.clients)}", flush=True)
+    try:
+        # Clients don't send anything after hello; just wait for close.
         async for _ in ws:
             pass
+    except ConnectionClosed:
+        pass
     finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        STATE.clients.discard(client)
+        if client.sender is not None:
+            client.sender.cancel()
+            with suppress(asyncio.CancelledError):
+                await client.sender
+        print(f"client disconnected: id={client_id} sent={client.sent} "
+              f"coalesced={client.coalesced}; clients={len(STATE.clients)}",
+              flush=True)
 
 
 async def handler(ws) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+        if not isinstance(hello, dict):
+            raise ValueError
+    except (asyncio.TimeoutError, json.JSONDecodeError, ValueError, ConnectionClosed):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
 
     msg_type = hello.get("type")
-    if msg_type == "SOURCE_HELLO":
-        await handle_source(ws, hello)
-    elif msg_type == "CLIENT_HELLO":
-        await handle_client(ws, hello)
-    else:
+    if msg_type not in ("SOURCE_HELLO", "CLIENT_HELLO"):
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
+        return
+    session = hello.get("session")
+    if not isinstance(session, str) or not session.strip():
+        await ws.close(code=1008, reason="Expected a nonempty session")
+        return
+    if STATE.session is not None and session != STATE.session:
+        await ws.close(code=1008, reason="One session per server run; restart for a new lecture")
+        return
+    if msg_type == "SOURCE_HELLO" and STATE.source is not None:
+        await ws.close(code=1008, reason="A source is already connected")
+        return
+    # No await between checking and claiming the session/source.
+    STATE.session = session
+    if msg_type == "SOURCE_HELLO":
+        STATE.source = ws
+        await handle_source(ws, hello)
+    else:
+        await handle_client(ws, hello)
+
+
+class _IgnoreProbeHandshakes(logging.Filter):
+    """Test harnesses probe the port with plain TCP connects; don't log those."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "opening handshake failed" not in record.getMessage()
 
 
 async def main_async(port: int) -> None:
-    async with websockets.serve(
+    logging.basicConfig(level=logging.WARNING)
+    logging.getLogger("websockets.server").addFilter(_IgnoreProbeHandshakes())
+    async with serve(
         handler,
         "0.0.0.0",
         port,
         max_size=2**20,
         ping_interval=20,
         ping_timeout=20,
+        write_limit=WRITE_LIMIT_BYTES,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
-        await asyncio.Future()
+        print(f"LiveRecall server listening on ws://0.0.0.0:{port}", flush=True)
+        stats = asyncio.create_task(STATE.stats_loop())
+        try:
+            await asyncio.Future()
+        finally:
+            stats.cancel()
+            with suppress(asyncio.CancelledError):
+                await stats
 
 
 def main() -> None:
