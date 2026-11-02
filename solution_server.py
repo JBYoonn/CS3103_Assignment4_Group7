@@ -82,6 +82,15 @@ CLIENT_SNDBUF_BYTES = 32 * 1024   # kernel send buffer per client socket
 WRITE_LIMIT_BYTES = 16 * 1024     # websockets user-space write buffer
 PING_EVERY = 4                    # messages between flow-control pings
 MAX_UNACKED_PINGS = 1             # gate sending on outstanding transport pings
+SLOW_BLOCK_SECONDS = 1.0          # window wait that counts as a slow-reader sign
+SLOW_BLOCKS_NEEDED = 2            # consecutive long waits before acting
+SLOW_PING_AGE_SECONDS = 4.0       # an unanswered ping this old = slow reader
+FINALS_ONLY_HOLD_SECONDS = 10.0   # finals-only period once a reader is slow
+RESET_FINALS_ONLY_SECONDS = 60.0  # finals-only period after a reset client reconnects
+RESET_SLOW_CLIENTS = True         # reset-and-resume; --no-reset-slow turns it off
+RESET_COOLDOWN_SECONDS = 60.0     # at most one reset per client per minute
+SLOW_MEMORY_SECONDS = 300.0       # remember a reset client_id this long
+SLOW_IDS_MAX = 10000              # bound on remembered client ids
 LAG_SECONDS = 1.0                 # unanswered ping older than this = lagging
 STATS_INTERVAL = 10.0             # seconds between status log lines
 
@@ -94,7 +103,8 @@ class Client:
     """Delivery state for one connected student client."""
 
     __slots__ = ("ws", "client_id", "pending", "wakeup", "sender",
-                 "sent", "coalesced", "closing")
+                 "sent", "coalesced", "closing", "slow_episodes",
+                 "finals_only_until", "slow_blocks")
 
     def __init__(self, ws, client_id: Any) -> None:
         self.ws = ws
@@ -107,6 +117,9 @@ class Client:
         self.sent = 0
         self.coalesced = 0
         self.closing = False
+        self.slow_episodes = 0
+        self.finals_only_until = 0.0    # slow-reader mode deadline (monotonic)
+        self.slow_blocks = 0            # consecutive long window waits
 
     def enqueue(self, key: Any, raw: str, final: bool) -> bool:
         """Queue one message. Returns False if the client is hopelessly behind."""
@@ -136,23 +149,37 @@ class Client:
         """
         waiters: deque[tuple[float, asyncio.Future]] = deque()   # (sent_at, pong)
         since_ping = 0
+        min_rtt = 1.0              # best ping round trip seen for this client
         try:
             while True:
                 while waiters and waiters[0][1].done():
-                    waiters.popleft()
+                    _, fut = waiters.popleft()
+                    rtt = None if fut.cancelled() or fut.exception() else fut.result()
+                    if isinstance(rtt, float):
+                        min_rtt = min(min_rtt, rtt)
                 # Lagging = the client has not answered a ping sent over
                 # LAG_SECONDS ago. While lagging, send finals only: the
                 # provisional revisions stay queued (and keep being replaced
                 # by newer ones), so the reader's limited bandwidth goes to
                 # durable state and it can catch up.
-                lagging = bool(waiters) and time.monotonic() - waiters[0][0] > LAG_SECONDS
+                now = time.monotonic()
+                # A ping unanswered for several seconds means the client has
+                # stopped reading (its library queue is full), however the
+                # window waits looked. Catches severe and bursty slow readers.
+                if waiters and now - waiters[0][0] > self._ping_age_limit(min_rtt):
+                    if self._mark_slow(now):
+                        return
+                lagging = (now < self.finals_only_until or
+                           (bool(waiters) and now - waiters[0][0] > LAG_SECONDS))
                 key = self._next_key(finals_only=lagging)
 
                 if key is None:
                     if self.pending:
                         # Only provisionals left and the client is lagging:
-                        # wait for it to catch up (or for a new final).
-                        await asyncio.wait([waiters[0][1]], timeout=0.1)
+                        # re-check shortly, or sooner if a new final arrives.
+                        self.wakeup.clear()
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(self.wakeup.wait(), 0.1)
                     else:
                         self.wakeup.clear()
                         await self.wakeup.wait()
@@ -165,11 +192,56 @@ class Client:
                 if since_ping >= PING_EVERY:
                     since_ping = 0
                     waiters.append((time.monotonic(), await self.ws.ping()))
-                    while len(waiters) > MAX_UNACKED_PINGS:
-                        await waiters[0][1]
-                        waiters.popleft()
+                    if len(waiters) > MAX_UNACKED_PINGS:
+                        blocked_at = time.monotonic()
+                        while len(waiters) > MAX_UNACKED_PINGS:
+                            sent_at, fut = waiters.popleft()
+                            limit = self._ping_age_limit(min_rtt)
+                            remaining = sent_at + limit - time.monotonic()
+                            if remaining > 0:
+                                await asyncio.wait([fut], timeout=remaining)
+                            if not fut.done():
+                                # Still no pong after the limit: slow reader.
+                                if self._mark_slow(time.monotonic()):
+                                    return
+                            rtt = await fut
+                            if isinstance(rtt, float):
+                                min_rtt = min(min_rtt, rtt)
+                        # The window was full: we produce faster than this
+                        # client reads. A wait well beyond its normal round
+                        # trip means a slow reader (not just network delay),
+                        # so send it finals only for a while. Finals arrive
+                        # at about a third of the revision rate, which lets
+                        # the client drain buffers we cannot see.
+                        # One long wait can be a TCP retransmission stall on
+                        # a lossy link, so only consecutive long waits count.
+                        now = time.monotonic()
+                        if now - blocked_at > max(SLOW_BLOCK_SECONDS, 4 * min_rtt):
+                            self.slow_blocks += 1
+                        else:
+                            self.slow_blocks = 0
+                        if self.slow_blocks >= SLOW_BLOCKS_NEEDED:
+                            # Reset and resume: the client's own WebSocket
+                            # library still holds ~16 stale messages we can't
+                            # withdraw. Closing the connection discards them;
+                            # the client reconnects with its last final and
+                            # gets everything it missed in ONE HISTORY message,
+                            # then starts in finals-only mode (see register).
+                            if self._mark_slow(now):
+                                return
         except ConnectionClosed:
             pass
+
+    @staticmethod
+    def _ping_age_limit(min_rtt: float) -> float:
+        return max(SLOW_PING_AGE_SECONDS, 8 * min_rtt)
+
+    def _mark_slow(self, now: float) -> bool:
+        """Put a slow reader in finals-only mode; True if it was reset."""
+        if now >= self.finals_only_until:
+            self.slow_episodes += 1
+        self.finals_only_until = now + FINALS_ONLY_HOLD_SECONDS
+        return STATE.reset_slow_client(self)
 
     def _next_key(self, finals_only: bool) -> Any:
         if not self.pending:
@@ -198,7 +270,10 @@ class LiveRecallServer:
         self.active: tuple[int, int, str] | None = None   # (seg, rev, raw)
         self.updates_in = 0
         self.updates_ignored = 0
+        # client_id -> (remember_until, last_reset) for clients reset as slow
+        self.slow_ids: OrderedDict[Any, tuple[float, float]] = OrderedDict()
         self.slow_disconnects = 0
+        self.slow_resets = 0
 
     # ---- source side ----------------------------------------------------
     def accept_update(self, msg: dict[str, Any]) -> None:
@@ -284,23 +359,46 @@ class LiveRecallServer:
             seg, rev, raw = self.active
             if _seg_rev_newer(seg, rev, last_seg, last_rev):
                 client.pending[seg] = (raw, False)
+        cid = client.client_id
+        known = self.slow_ids.get(cid) if isinstance(cid, (int, str)) else None
+        if known is not None and time.monotonic() < known[0]:
+            # A client we reset as slow: start it in finals-only mode so it
+            # doesn't refill its buffers with provisionals straight away.
+            client.finals_only_until = time.monotonic() + RESET_FINALS_ONLY_SECONDS
         client.wakeup.set()
         self.clients.add(client)
         return len(items)
 
-    def drop_slow_client(self, client: Client) -> None:
+    def reset_slow_client(self, client: Client) -> bool:
+        """Close a slow reader so it resumes via HISTORY. False = not reset."""
+        cid = client.client_id
+        if not RESET_SLOW_CLIENTS or not isinstance(cid, (int, str)):
+            return False
+        now = time.monotonic()
+        known = self.slow_ids.get(cid)
+        if known is not None and now - known[1] < RESET_COOLDOWN_SECONDS:
+            return False                 # reset recently: don't churn
+        self.slow_ids[cid] = (now + SLOW_MEMORY_SECONDS, now)
+        self.slow_ids.move_to_end(cid)
+        while len(self.slow_ids) > SLOW_IDS_MAX:
+            self.slow_ids.popitem(last=False)
+        self.slow_resets += 1
+        self.drop_slow_client(client, "slow reader; reconnect to resume from HISTORY")
+        return True
+
+    def drop_slow_client(self, client: Client,
+                         reason: str = "client too slow; reconnect to resume") -> None:
         if client.closing:
             return
         client.closing = True
         self.clients.discard(client)
         client.pending.clear()
         self.slow_disconnects += 1
-        print(f"client {client.client_id} too far behind; disconnecting "
-              f"so it can resume from HISTORY", flush=True)
+        print(f"client {client.client_id} disconnected: {reason}", flush=True)
         if client.sender is not None:
             client.sender.cancel()
         asyncio.get_running_loop().create_task(
-            client.ws.close(code=1013, reason="client too slow; reconnect to resume"))
+            client.ws.close(code=1013, reason=reason))
 
     async def stats_loop(self) -> None:
         while True:
@@ -311,7 +409,7 @@ class LiveRecallServer:
             backlog = max((len(c.pending) for c in self.clients), default=0)
             print(f"[stats] clients={len(self.clients)} updates={self.updates_in} "
                   f"ignored={self.updates_ignored} history={len(self.history)} "
-                  f"max_backlog={backlog} slow_drops={self.slow_disconnects}",
+                  f"max_backlog={backlog} slow_drops={self.slow_disconnects} slow_resets={self.slow_resets}",
                   flush=True)
 
 
@@ -333,6 +431,8 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     print(f"source connected: session={hello.get('session')}", flush=True)
     try:
         async for raw in ws:
+            if STATE.source is not ws:
+                break                  # replaced by a newer source connection
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -389,7 +489,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
             with suppress(asyncio.CancelledError):
                 await client.sender
         print(f"client disconnected: id={client_id} sent={client.sent} "
-              f"coalesced={client.coalesced}; clients={len(STATE.clients)}",
+              f"coalesced={client.coalesced} slow_episodes={client.slow_episodes}; clients={len(STATE.clients)}",
               flush=True)
 
 
@@ -414,13 +514,18 @@ async def handler(ws) -> None:
     if STATE.session is not None and session != STATE.session:
         await ws.close(code=1008, reason="One session per server run; restart for a new lecture")
         return
-    if msg_type == "SOURCE_HELLO" and STATE.source is not None:
-        await ws.close(code=1008, reason="A source is already connected")
-        return
     # No await between checking and claiming the session/source.
     STATE.session = session
     if msg_type == "SOURCE_HELLO":
+        old = STATE.source
         STATE.source = ws
+        if old is not None:
+            # A reconnecting source replaces the old connection at once.
+            # Waiting for the old one to time out could lose up to
+            # ping_interval + ping_timeout seconds of captions.
+            print("new source connected; closing the previous source", flush=True)
+            asyncio.get_running_loop().create_task(
+                old.close(code=1012, reason="replaced by a new source connection"))
         await handle_source(ws, hello)
     else:
         await handle_client(ws, hello)
@@ -444,6 +549,9 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
         write_limit=WRITE_LIMIT_BYTES,
+        # Captions are ~200-byte JSON. Per-message deflate would compress every
+        # message separately for every client, which dominates CPU at scale.
+        compression=None,
     ):
         print(f"LiveRecall server listening on ws://0.0.0.0:{port}", flush=True)
         stats = asyncio.create_task(STATE.stats_loop())
@@ -458,7 +566,12 @@ async def main_async(port: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-reset-slow", action="store_true",
+                        help="keep slow readers connected instead of reset-and-resume")
     args = parser.parse_args()
+    if args.no_reset_slow:
+        global RESET_SLOW_CLIENTS
+        RESET_SLOW_CLIENTS = False
     try:
         asyncio.run(main_async(args.port))
     except KeyboardInterrupt:
