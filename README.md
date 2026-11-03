@@ -9,7 +9,7 @@ LiveRecall is Group 7's CS3103 Assignment 4 application for distributing provisi
 - Nicole Teh Mat Xin (A0342054N)
 - Chin Shang Zer Ian (A0307824A)
 
-Browser-client ownership is documented in [client/README.md](client/README.md). Other individual responsibilities are unspecified because the repository contains only an unfilled contributions template.
+Individual responsibilities and contribution percentages are documented in [CONTRIBUTIONS.md](CONTRIBUTIONS.md).
 
 ## Ubuntu setup
 
