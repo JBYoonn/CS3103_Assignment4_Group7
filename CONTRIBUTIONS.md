@@ -15,6 +15,6 @@ Total contribution should be 100%.
 
 - **23 Oct meeting (all):** agreed the architecture: server history of finals, per-client send queues that replace redundant revisions, 90 s client history. Split work into server (Jia Bao, Ian) and client (Wilson, Nicole).
 - **28 Oct meeting (all):** reviewed and merged the client pull request (Wilson's v2 on Nicole's client) and the server pull requests (Jia Bao's branch first, then Ian's, which builds on it). Ran the three components together (server, client web server, `caption_source.py`) and confirmed live revision replacement in the browser. Divided the report and documentation.
-- **Results at integration:** 100% final completeness at 100 and 200 clients; slow-client P95 ≈ 9.8 s _(Jia Bao: update with final medians)_.
+- **Final results (median of 3 runs, final server):** 100% final completeness on all five public tests (T1–T5), with 0 duplicate or stale messages. Normal-client P95 caption age ≤ 5.23 ms on T1–T4; slow-client P95 ≈ 9.6 s on T3 (10% slow clients). See the report’s Results section.
 - **Review process:** all code and documentation merged into `main` through GitHub pull requests reviewed by another member.
 - **AI assistance:** declared in `AI_USAGE.md`.
