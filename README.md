@@ -136,7 +136,7 @@ sudo bash network_profiles/reset.sh lo
 
 All five commands use the default seed `3103`, session `L1`, port `8765`, 30-second history requests, and a 500 ms freshness threshold. The runner selects the source segment count from the test duration. Caption content and client roles are reproducible; timings remain dependent on system and network conditions.
 
-Per-run metrics and final medians appear in the terminal. CSV event logs and JSON summaries are saved beside `run_demo.py`, for example `t1_run01.csv` / `t1_run01.json` through `t1_run03.csv` / `t1_run03.json`. Reusing an output stem overwrites those files; choose a different stem to retain earlier results.
+Per-run metrics and final medians appear in the terminal. Running the commands generates CSV event logs and JSON summaries beside `run_demo.py`; these output files are not included in the published repository. Reusing an output stem overwrites previously generated files, so choose a different stem to retain earlier results.
 
 | Metric                                      | Interpretation                                                                                                                                                                                                          |
 | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -155,7 +155,7 @@ Per-run metrics and final medians appear in the terminal. CSV event logs and JSO
 | T4   |            100.00% |       98.42% |         8.36 |        10.68 | 0/0/0                          |
 | T5   |            100.00% |       86.90% |       637.96 |      1168.02 | 1/0/0                          |
 
-T3 reset ten slow clients per run; normal-client P95 was 7.77 ms and slow-client P95 was 8558.28 ms. T4 median recovery P95 was 89.88 ms. T5 reset one client in its first run despite no configured slow readers, so no general absence of false detections is claimed. The netem profile was removed after testing. See [verification results and raw-data index](verification_results/2026-11-02_1f5dee3/RESULTS.md) for per-run records and limitations.
+T3 reset ten slow clients per run; normal-client P95 was 7.77 ms and slow-client P95 was 8558.28 ms. T4 median recovery P95 was 89.88 ms. T5 reset one client in its first run despite no configured slow readers, so no general absence of false detections is claimed. The netem profile was removed after testing.
 
 For optional RSS observation during a running Ubuntu experiment, use a separate terminal:
 
@@ -172,7 +172,7 @@ python submission_check.py
 
 The startup check verifies files and a WebSocket hello; it does not validate performance or browser functionality.
 
-The existing regression suite contains an outdated source-rejection expectation: `test_second_source_and_other_session_are_rejected` expects the replacement source to close with code `1008`, whereas the merged server closes the previous source with `1012`. The recorded verification has one timeout and eight passing server tests. The separate takeover check in the linked verification results passed replacement-source delivery and cross-session rejection.
+The existing regression suite contains an outdated source-rejection expectation: `test_second_source_and_other_session_are_rejected` expects the replacement source to close with code `1008`, whereas the merged server closes the previous source with `1012`. The recorded verification has one timeout and eight passing server tests.
 
 The client state tests require Node.js with the built-in test runner; Node.js is not needed to run the application or T1-T5. With Node.js installed, run:
 
