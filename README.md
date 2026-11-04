@@ -6,7 +6,7 @@ LiveRecall is Group 7's CS3103 Assignment 4 application for distributing provisi
 
 - Yoon Jia Bao (A0307920J)
 - Soon Fu Hong Wilson (A0273596M)
-- Nicole Teh Mat Xin (A0342054N)
+- Nicole Teh May Xin (A0342054N)
 - Chin Shang Zer Ian (A0307824A)
 
 Individual responsibilities and contribution percentages are documented in [CONTRIBUTIONS.md](CONTRIBUTIONS.md).
